@@ -85,7 +85,9 @@ INVALID_LOGPROB = 1.0
 class PolicyAndValueWrapper(nn.Module):
     def __init__(self, policy, value_model) -> None:
         super().__init__()
+        # policy-> actor
         self.policy = policy
+        # value -> critic
         self.value_model = value_model
         self.critic_backbone = getattr(value_model, value_model.base_model_prefix)
 
@@ -219,9 +221,10 @@ class PPOTrainer(Trainer):
         #########
         for module in [self.policy_model, self.ref_model, self.value_model, self.reward_model]:
             if module is not None:
-                disable_dropout_in_model(module)
+                disable_dropout_in_model(module) # 在强化学习中，需要禁用dropout
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = processing_class.eos_token_id
+        # value model 就是critic model
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
         self.create_optimizer_and_scheduler(
@@ -341,6 +344,7 @@ class PPOTrainer(Trainer):
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
+        # actor -> policy model
         model = self.model
         ref_policy = self.ref_model
         reward_model = self.reward_model
@@ -371,7 +375,7 @@ class PPOTrainer(Trainer):
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
         ratio_stats = torch.zeros(stats_shape, device=device)
-        model.train()
+        model.train() # model设为train模式
 
         # trainer state initialization
         self.state.global_step = 0
@@ -415,6 +419,7 @@ class PPOTrainer(Trainer):
                 sequence_lengths = []
                 values = []
                 with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                    # 从policy model中生成当前query的response
                     query_responses, logitss = batch_generation(
                         unwrapped_model.policy,
                         queries,
@@ -424,11 +429,18 @@ class PPOTrainer(Trainer):
                     )
 
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
+                    # query:[batch, query_len]
                     query = queries[i : i + args.local_rollout_forward_batch_size]
+                    # query_response:[batch, query_resp_len]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
+                    # response:[batch, resp_len]
                     response = query_response[:, context_length:]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
+                    # logits: 为 policy model生成的logits, [batch, seq_len, vocab_size], 记住：logits为进入softmax之前值
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size] # [batch, seq_len, vocab_size]
+                    # all_logprob: [batch, seq_len, vocab_size]
                     all_logprob = F.log_softmax(logits, dim=-1)
+                    # 获取response的log_prob
+                    # logprob:[batch, resp_len, vocab_size]
                     logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                     del logits, all_logprob
                     torch.cuda.empty_cache()
@@ -437,46 +449,62 @@ class PPOTrainer(Trainer):
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
                     else:
+                        # 计算ref sft model的输出
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    # 只要response的logits
+                    # ref_logits:[batch, resp_len, vocab_size]
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
+                    # 只要response的logprob
                     ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                     del ref_output, ref_logits, ref_all_logprob
                     torch.cuda.empty_cache()
 
                     # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
+                    # response:[batch, resp_len]
                     postprocessed_response = response
                     if args.stop_token_id is not None:  # handle the edge case when stop_token_id exists but is 0
-                        postprocessed_response = truncate_response(
-                            args.stop_token_id, processing_class.pad_token_id, response
-                        )
+                        postprocessed_response = truncate_response(args.stop_token_id, processing_class.pad_token_id, response)
 
                     # Response Processing 2. run reward model on the truncated responses
+                    # query:[batch, query_len]
+                    # response:[batch, resp_len]
+                    # postprocessed_query_response:[batch, query_len+resp_len]
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                    # sequence_length:[batch]
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    # critic model
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    full_value, _, _ = get_reward(
-                        unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
-                    )
+                    # 获取critic model对query+response的logits
+                    # full value: [batch, query_len+resp_len]
+                    full_value, _, _ = get_reward(unwrapped_value_model, query_response, processing_class.pad_token_id, context_length)
+                    # 获取critic model对response部分的logits
+                    # critic value: [batch, resp_len]
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    # 获取reward model对query+response的打分score
+                    # score:[batch]
                     _, score, _ = get_reward(
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
 
-                    responses.append(response)
-                    postprocessed_responses.append(postprocessed_response)
-                    logprobs.append(logprob)
-                    ref_logprobs.append(ref_logprob)
+                    responses.append(response) #  response:[batch, resp_len]
+                    postprocessed_responses.append(postprocessed_response) # [batch, resp_len]
+                    logprobs.append(logprob) # logprob:[batch, resp_len, vocab_size]
+                    ref_logprobs.append(ref_logprob) # ref_logits:[batch, resp_len, vocab_size]
                     sequence_lengths.append(sequence_length)
-                    scores.append(score)
-                    values.append(value)
+                    scores.append(score) # reward score
+                    values.append(value) # critic value
+
+                # 将多个batch按行cat在一起，即[batch, resp_len] -> [N*batch, resp_len]
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
                 logprobs = torch.cat(logprobs, 0)
                 ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
+                # reward scores
                 scores = torch.cat(scores, 0)
+                # critic values
                 values = torch.cat(values, 0)
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 torch.cuda.empty_cache()
@@ -496,19 +524,21 @@ class PPOTrainer(Trainer):
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
+                # critic values
                 values = torch.masked_fill(values, padding_mask_p1, 0)
 
                 # 4. compute rewards
-                kl = logprobs - ref_logprobs
+                kl = logprobs - ref_logprobs # kl-divergence loss, 防止policy model与ref model差得太远
                 non_score_reward = -args.kl_coef * kl
                 rewards = non_score_reward.clone()
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
+                # 总打分 = （-kl_loss） + reward模型的打分
                 rewards[[actual_start, actual_end]] += scores
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
-                    rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False)
+                    rewards = masked_whiten(rewards, mask=~padding_mask_p1, shift_mean=False) # 减均值/除方差
                     rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
                 # 6. compute advantages and returns
@@ -517,10 +547,12 @@ class PPOTrainer(Trainer):
                 gen_length = responses.shape[1]
                 for t in reversed(range(gen_length)):
                     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                    # TD-Error = R(t) + gamma* V(t+1) - V(t)
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
+                # A(s,a) = Q(s,a) - V(s)，因此，returns = Q(s,a) = A(s,a)+V(s)
                 returns = advantages + values
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
@@ -528,7 +560,7 @@ class PPOTrainer(Trainer):
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
             for ppo_epoch_idx in range(args.num_ppo_epochs):
-                b_inds = np.random.permutation(args.local_batch_size)
+                b_inds = np.random.permutation(args.local_batch_size) # 生成一组排列
                 minibatch_idx = 0
                 for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
@@ -542,9 +574,11 @@ class PPOTrainer(Trainer):
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
+                            # 取出return: Q(s,a)
                             mb_return = returns[micro_batch_inds]
                             mb_values = values[micro_batch_inds]
 
+                            # micro-batch
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
@@ -560,6 +594,7 @@ class PPOTrainer(Trainer):
                                 mb_values - args.cliprange_value,
                                 mb_values + args.cliprange_value,
                             )
+                            # critic-loss: mse loss
                             vf_losses1 = torch.square(vpred - mb_return)
                             vf_losses2 = torch.square(vpredclipped - mb_return)
                             vf_loss_max = torch.max(vf_losses1, vf_losses2)
@@ -567,12 +602,15 @@ class PPOTrainer(Trainer):
                             vf_clipfrac = masked_mean(
                                 (vf_losses2 > vf_losses1).float(), ~padding_mask_p1[micro_batch_inds]
                             )
+
+                            # ppo loss
                             logprobs_diff = new_logprobs - mb_logprobs
-                            ratio = torch.exp(logprobs_diff)
+                            ratio = torch.exp(logprobs_diff)# 重要性采样
                             pg_losses = -mb_advantage * ratio
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+                            # policy loss + critic loss
                             loss = pg_loss + args.vf_coef * vf_loss
                             accelerator.backward(loss)
                             optimizer.step()

@@ -44,9 +44,9 @@ class PPOConfig(OnPolicyConfig):
         kl_coef (`float`, *optional*, defaults to `0.05`):
             KL coefficient.
         cliprange (`float`, *optional*, defaults to `0.2`):
-            Clip range.
+            Clip range. 这个是非语言模型的PPO原始的参数
         vf_coef (`float`, *optional*, defaults to `0.1`):
-            Value function coefficient.
+            Value function coefficient. critic model
         cliprange_value (`float`, *optional*, defaults to `0.2`):
             Clip range for the value function.
         gamma (`float`, *optional*, defaults to `1.0`):
