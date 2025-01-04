@@ -409,6 +409,7 @@ class PPOTrainer(Trainer):
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
+                # 取一批query让模型rollout尝试生成不同的输出, 即与模型交互收集不同的数据
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
                 responses = []
@@ -531,6 +532,7 @@ class PPOTrainer(Trainer):
                 kl = logprobs - ref_logprobs # kl-divergence loss, 防止policy model与ref model差得太远
                 non_score_reward = -args.kl_coef * kl
                 rewards = non_score_reward.clone()
+                # actual_start~actual_end只有一个token,即最后一个token才能获得reward score
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
                 # 总打分 = （-kl_loss） + reward模型的打分
@@ -562,6 +564,11 @@ class PPOTrainer(Trainer):
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size) # 生成一组排列
                 minibatch_idx = 0
+                """
+                PPO 是同策略on-policy, 每个epoch更新N次模型
+                Experience buffer by mini-batch:
+                { (at, st), Pai_old(at, st), A(st, at), R(t) }
+                """
                 for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
@@ -613,6 +620,7 @@ class PPOTrainer(Trainer):
                             # policy loss + critic loss
                             loss = pg_loss + args.vf_coef * vf_loss
                             accelerator.backward(loss)
+                            # 更新模型
                             optimizer.step()
                             optimizer.zero_grad()
                             with torch.no_grad():
