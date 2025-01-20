@@ -441,7 +441,8 @@ class PPOTrainer(Trainer):
                     # all_logprob: [batch, seq_len, vocab_size]
                     all_logprob = F.log_softmax(logits, dim=-1)
                     # 获取response的log_prob
-                    # logprob:[batch, resp_len, vocab_size]
+                    # all_logprob:[batch, resp_len, vocab_size]
+                    # logprob:[batch, resp_len]
                     logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
                     del logits, all_logprob
                     torch.cuda.empty_cache()
